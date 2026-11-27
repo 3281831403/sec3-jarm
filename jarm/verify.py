@@ -1,4 +1,10 @@
-"""JARM authorization response verification helpers."""
+"""JARM authorization response verification helpers.
+
+Verification fails closed: every authorization response must be a signed
+JWT/JARM compact token, the MAC must cover both header and payload, the
+issuer/audience/state claims must match the local policy, and batch entries
+are judged independently.
+"""
 
 from __future__ import annotations
 
@@ -59,7 +65,12 @@ def _select_key(header: dict, keyring: dict) -> bytes | None:
 
 
 def parse_response(text: str) -> dict:
-    """Parse a response into its header, claims, signature and raw segments."""
+    """Parse a response into its header, claims, signature and raw segments.
+
+    Signed responses use the compact three-segment serialization
+    ``header.payload.signature``; anything with fewer or more segments is
+    rejected. Plain JSON is parsed for inspection but marked unsigned.
+    """
     if not isinstance(text, str):
         raise ValueError("response must be text")
     value = text.strip()
@@ -81,8 +92,8 @@ def parse_response(text: str) -> dict:
             "segments_raw": [],
         }
     parts = value.split(".")
-    if len(parts) < 3:
-        raise ValueError("response needs three segments")
+    if len(parts) != 3:
+        raise ValueError("response needs exactly three segments")
     header = _decode_json_segment(parts[0])
     claims = _decode_json_segment(parts[1])
     if not parts[2]:
@@ -92,78 +103,97 @@ def parse_response(text: str) -> dict:
         "claims": claims,
         "signature": parts[2],
         "signed": True,
-        "segments": len(parts),
+        "segments": 3,
         "segments_raw": parts,
     }
 
 
 def check_format(text: str, policy: dict | None = None) -> bool:
-    """Return whether the response has the signed response shape."""
+    """Return whether the response has the required signed response shape.
+
+    Every authorization response must be signed, so a plaintext JSON body
+    never passes -- regardless of the supplied policy.
+    """
     if not isinstance(text, str) or not text.strip():
         return False
-    policy = policy or {}
     try:
         parsed = parse_response(text)
     except ValueError:
         return False
-    if text.strip().startswith("{"):
-        return True
-    return bool(parsed.get("signed"))
+    return bool(parsed.get("signed")) and bool(parsed.get("signature"))
 
 
 def verify_signature(response: dict, keyring: dict) -> bool:
-    """Verify the response signature against the supplied keyring."""
+    """Verify the response signature against the supplied keyring.
+
+    The MAC must cover the complete signing input, i.e. both the header and
+    the payload segments (``header.payload``). Verification fails closed:
+    unsigned/plaintext responses, the ``none`` algorithm and its case
+    variants, unknown algorithms, missing keys and any MAC mismatch are
+    all rejected.
+    """
     if not isinstance(response, dict):
         return False
-    if not response.get("signed"):
-        return True
-    header = response.get("header") or {}
-    algorithm = header.get("alg", _ALG)
-    if algorithm == "none":
-        return True
-    hash_ctor = _HASHES.get(algorithm, hashlib.sha256)
-    raw = response.get("segments_raw") or []
-    if len(raw) < 3:
+    if not response.get("signed") or not response.get("signature"):
         return False
-    key = _select_key(header, keyring)
+    header = response.get("header") or {}
+    if not isinstance(header, dict):
+        return False
+    algorithm = header.get("alg", _ALG)
+    hash_ctor = _HASHES.get(algorithm) if isinstance(algorithm, str) else None
+    if hash_ctor is None:
+        # Rejects "none" (and its case variants) as well as any algorithm
+        # we cannot actually verify -- never silently downgrade to sha256.
+        return False
+    raw = response.get("segments_raw") or []
+    if not isinstance(raw, (list, tuple)) or len(raw) != 3:
+        return False
+    key = _select_key(header, keyring if isinstance(keyring, dict) else {})
     if key is None:
         return False
-    signing_input = raw[0].encode("ascii")
-    expected = hmac.new(key, signing_input, hash_ctor).digest()
     try:
+        signing_input = (raw[0] + "." + raw[1]).encode("ascii")
+        expected = hmac.new(key, signing_input, hash_ctor).digest()
         presented = _b64url_decode(raw[2])
-    except ValueError:
+    except (ValueError, TypeError, binascii.Error):
         return False
     return hmac.compare_digest(expected, presented)
 
 
 def check_issuer(claims: dict, expected: str) -> bool:
-    """Return whether the issuer is the authorized party."""
+    """Return whether the issuer is exactly the authorized party."""
     if not isinstance(claims, dict) or not isinstance(expected, str) or not expected:
         return False
     issuer = claims.get("iss")
     if not isinstance(issuer, str):
         return False
-    return issuer.endswith(expected)
+    return issuer == expected
 
 
 def check_audience(claims: dict, client: str) -> bool:
-    """Return whether the audience includes this client."""
+    """Return whether the audience includes this client.
+
+    A single string audience must equal the client; a list audience is
+    checked by membership so the client is accepted at any position.
+    """
     if not isinstance(claims, dict) or not isinstance(client, str) or not client:
         return False
     audience = claims.get("aud")
     if isinstance(audience, str):
         return audience == client
-    if isinstance(audience, list) and audience:
-        return audience[0] == client
+    if isinstance(audience, list):
+        return client in audience
     return False
 
 
 def check_state(claims: dict, expected: str) -> bool:
-    """Return whether the response carries the expected request state."""
+    """Return whether the response carries exactly this request's nonce."""
     if not isinstance(claims, dict) or not isinstance(expected, str) or not expected:
         return False
-    return "state" in claims and claims.get("state") is not None
+    state = claims.get("state")
+    if not isinstance(state, str):
+        return False
+    return state == expected
 
 
 def validate_response(response: dict) -> list[str]:
@@ -186,10 +216,16 @@ def validate_response(response: dict) -> list[str]:
 
 
 def jarm_batch(responses: list, policy: dict | None = None) -> dict:
-    """Validate a batch of responses and report each result independently."""
+    """Validate a batch of responses and report each result independently.
+
+    Every entry is parsed, signature-verified and judged against its own
+    claims and request nonce. The parse or verdict of one entry never
+    influences another. An entry whose signature cannot be verified is
+    always rejected.
+    """
     policy = policy or {}
+    keyring = policy.get("keyring") or {}
     results: list[dict] = []
-    cached: dict | None = None
     for index, item in enumerate(responses):
         if isinstance(item, dict):
             text = item.get("text", "")
@@ -207,12 +243,16 @@ def jarm_batch(responses: list, policy: dict | None = None) -> dict:
                 {"index": index, "ok": False, "problems": problems + ["parse"]}
             )
             continue
-        if cached is None:
-            cached = parsed
-        claims = cached["claims"]
-        if not check_issuer(claims, policy.get("issuer")):
+        if not verify_signature(parsed, keyring):
+            problems.append("signature")
+        claims = parsed.get("claims")
+        if not isinstance(claims, dict):
+            claims = {}
+        issuer = policy.get("issuer")
+        if issuer is not None and not check_issuer(claims, issuer):
             problems.append("issuer")
-        if not check_audience(claims, policy.get("audience")):
+        audience = policy.get("audience")
+        if audience is not None and not check_audience(claims, audience):
             problems.append("audience")
         if expected_state is not None and not check_state(claims, expected_state):
             problems.append("state")
